@@ -362,6 +362,7 @@ def lista(df: pd.DataFrame, colunas: list, chave: str, altura: int = 320, extra:
                  column_config=config)
 
 
+COL_PCT_BARRA = st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)
 COL_LINK = st.column_config.LinkColumn("Chamado", display_text=r"([A-Z]+-\d+)$")
 COL_CRIADO = st.column_config.DateColumn("Criado em", format="DD/MM/YYYY")
 COLS_CARD = ["Link", "Resumo", "Status", "Relator", "UF", "Marca"]
@@ -419,8 +420,9 @@ st.markdown(
     f"<div class='lido'>Base lida às {lido_em:%H:%M}</div></div>",
     unsafe_allow_html=True,
 )
-aba_funil, aba_onb, aba_sup, aba_uso, aba_cards = st.tabs(
-    ["Funil (Quadros 2 a 4)", "Onboarding (Quadro 4)", "Suporte (Quadro 5)", "Uso da ferramenta", "Cards"])
+aba_funil, aba_onb, aba_sup, aba_uso, aba_analista, aba_cards = st.tabs(
+    ["Funil (Quadros 2 a 4)", "Onboarding (Quadro 4)", "Suporte (Quadro 5)", "Uso da ferramenta", "Por analista",
+     "Cards"])
 
 # ---------- Funil ----------
 with aba_funil:
@@ -765,6 +767,133 @@ with aba_uso:
     if len(alertas):
         with card("q_cad", "Alertas de cadastro", "Em etapa que exige a revenda criada no banco, mas o CNPJ não foi encontrado"):
             lista(alertas, ["Link", "Resumo", "Status", "Relator", "UF", "Alerta_Cadastro"], "l_cad")
+
+
+# ---------- Por analista ----------
+ETAPAS_ANALISTA = [m.group(1) for c in impl.columns
+                   if (m := re.match(r"^Estourou (.+)$", c)) and m.group(1) not in {"Treinamento"}]
+
+
+def etapas_medidas(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Por card: etapas com SLA medido, etapas estouradas e os nomes das estouradas."""
+    if not ETAPAS_ANALISTA:
+        vazio = pd.Series(0, index=df.index)
+        return vazio, vazio, pd.Series("", index=df.index)
+    est = df[[f"Estourou {e}" for e in ETAPAS_ANALISTA]].astype(str)
+    est.columns = ETAPAS_ANALISTA
+    nomes = est.apply(lambda r: ", ".join(e for e in ETAPAS_ANALISTA if r[e] == "Sim"), axis=1)
+    return est.isin(["Sim", "Não"]).sum(axis=1), (est == "Sim").sum(axis=1), nomes
+
+
+def estourou_suporte(df: pd.DataFrame) -> pd.Series:
+    return (df["SLA_1a_Resposta_Violado"].eq("Sim") | df["SLA_Resolucao_Violado"].eq("Sim")
+            | (df["Aberto"] & (df["Tempo_Restante_Resolucao_h"] < 0)))
+
+
+def resumo_impl(g: pd.DataFrame, g_per: pd.DataFrame) -> dict:
+    abertos_g = g[g["Aberto"] & (g["Quadro"] != "Outros")]
+    finalizados = g[(g["Status"] == "Implantação Finalizada") & g["Data Resolucao"].between(ini_ts, fim_ts)]
+    medidos, estourados, _ = etapas_medidas(g_per)
+    return {
+        "Em andamento": len(abertos_g),
+        f"Parados {DIAS_ALERTA}+ dias": int((abertos_g["Dias no status atual"] >= DIAS_ALERTA).sum()),
+        "Criados no período": len(g_per),
+        "Finalizados no período": len(finalizados),
+        "Dias médios de implantação": (finalizados["Data Resolucao"] - finalizados["Data Criacao"]).dt.days.mean(),
+        "SLA de etapa no prazo": razao(medidos.sum() - estourados.sum(), medidos.sum()) * 100,
+        "Etapas estouradas": int(estourados.sum()),
+    }
+
+
+def resumo_sup(g: pd.DataFrame, g_per: pd.DataFrame) -> dict:
+    resolvidos = g_per[~g_per["Aberto"]]
+    return {
+        "Chamados no período": len(g_per),
+        "Resolvidos no período": int(g["Data Resolucao"].between(ini_ts, fim_ts).sum()),
+        "Em aberto agora": int(g["Aberto"].sum()),
+        "1ª resposta no SLA": g_per["SLA 1ª resposta OK"].mean() * 100,
+        "Média 1ª resposta (h)": g_per["Tempo_1a_Resposta_h"].mean(),
+        "Resolução no SLA": resolvidos["SLA resolução OK"].mean() * 100,
+        "Média resolução (h)": resolvidos["Tempo_Resolucao_h"].mean(),
+        "SLAs estourados": int(estourou_suporte(g_per).sum()),
+    }
+
+
+with aba_analista:
+    st.caption("Analista é o **responsável atual** do card no Jira. Cards sem responsável aparecem como "
+               "\"Não Informado\". Os números \"no período\" usam o período da barra lateral.")
+    nomes_analistas = sorted((set(impl["Responsável"]) | set(sup["Responsável"])) - {"Não Informado"})
+    analista = st.selectbox("Ver detalhe do analista", nomes_analistas, index=None, placeholder="Escolha um analista")
+    if analista:
+        mi, mi_per = impl[impl["Responsável"] == analista], impl_per[impl_per["Responsável"] == analista]
+        ms, ms_per = sup[sup["Responsável"] == analista], sup_per[sup_per["Responsável"] == analista]
+        ri, rs = resumo_impl(mi, mi_per), resumo_sup(ms, ms_per)
+        st.markdown("**Implantação**")
+        kpis([
+            dict(t="Em andamento", v=num(ri["Em andamento"])),
+            dict(t=f"Parados há {DIAS_ALERTA}+ dias", v=num(ri[f"Parados {DIAS_ALERTA}+ dias"]), c=ALERTA),
+            dict(t="Finalizados no período", v=num(ri["Finalizados no período"]), c=LIMA),
+            dict(t="Dias médios de implantação", v="—" if pd.isna(ri["Dias médios de implantação"])
+                 else f"{ri['Dias médios de implantação']:.0f}", c=AZUL_ESCURO),
+            dict(t="SLA de etapa no prazo", v=pct(ri["SLA de etapa no prazo"] / 100), c=CIANO,
+                 d=(f"{num(ri['Etapas estouradas'])} etapas estouradas", "")),
+        ])
+        st.markdown("**Suporte**")
+        kpis([
+            dict(t="Chamados no período", v=num(rs["Chamados no período"])),
+            dict(t="Em aberto agora", v=num(rs["Em aberto agora"]), c=CIANO),
+            dict(t="1ª resposta no SLA", v=pct(rs["1ª resposta no SLA"] / 100), c=LIMA,
+                 d=(f"tempo médio {horas(rs['Média 1ª resposta (h)'])}", "")),
+            dict(t="Resolução no SLA", v=pct(rs["Resolução no SLA"] / 100), c=LIMA,
+                 d=(f"tempo médio {horas(rs['Média resolução (h)'])}", "")),
+            dict(t="Chamados com SLA estourado", v=num(rs["SLAs estourados"]), c=ALERTA),
+        ])
+
+        e, d = st.columns(2, gap="medium")
+        with e, card("an_impl_ab", "Implantações em andamento", "Da mais parada para a menos parada"):
+            lista(mi[mi["Aberto"] & (mi["Quadro"] != "Outros")].sort_values("Dias no status atual", ascending=False),
+                  ["Link", "Resumo", "Status", "Dias no status atual", "UF", "Relator"], "l_an_impl_ab")
+        with d, card("an_sup_ab", "Suporte em aberto", "Do mais antigo para o mais recente"):
+            ab_s = ms[ms["Aberto"]].assign(**{"Dias em aberto": lambda x: (hoje - x["Data Criacao"]).dt.days})
+            lista(ab_s.sort_values("Dias em aberto", ascending=False),
+                  ["Link", "Resumo", "Motivo", "Status", "Dias em aberto", "Relator"], "l_an_sup_ab")
+
+        e, d = st.columns(2, gap="medium")
+        with e, card("an_impl_est", "Implantações com SLA de etapa estourado", "Cards criados no período"):
+            _, est_n, est_nomes = etapas_medidas(mi_per)
+            lista(mi_per.assign(**{"Etapas estouradas": est_nomes})[est_n > 0].sort_values("Data Criacao", ascending=False),
+                  ["Link", "Resumo", "Status", "Etapas estouradas", "UF"], "l_an_impl_est")
+        with d, card("an_sup_est", "Suporte com SLA estourado", "Chamados criados no período"):
+            se = ms_per[estourou_suporte(ms_per)].copy()
+            se["SLA estourado"] = np.where(se["SLA_1a_Resposta_Violado"].eq("Sim"), "1ª resposta", "") + \
+                np.where(se["SLA_Resolucao_Violado"].eq("Sim") | (se["Aberto"] & (se["Tempo_Restante_Resolucao_h"] < 0)),
+                         np.where(se["SLA_1a_Resposta_Violado"].eq("Sim"), ", resolução", "resolução"), "")
+            lista(se.sort_values("Data Criacao", ascending=False),
+                  ["Link", "Resumo", "SLA estourado", "Motivo", "Status", "Data Criacao"], "l_an_sup_est")
+
+    with card("an_tab_impl", "Implantação por analista", f"\"No período\": cards criados ou finalizados de "
+              f"{ini:%d/%m/%Y} a {fim:%d/%m/%Y}; \"Em andamento\" e \"Parados\" são a situação atual"):
+        tab_i = pd.DataFrame({a: resumo_impl(impl[impl["Responsável"] == a], impl_per[impl_per["Responsável"] == a])
+                              for a in sorted(set(impl["Responsável"]))}).T.rename_axis("Analista").reset_index()
+        tab_i[tab_i.columns[1:]] = tab_i[tab_i.columns[1:]].apply(pd.to_numeric, errors="coerce")
+        st.dataframe(tab_i.sort_values("Em andamento", ascending=False), hide_index=True, key="t_an_impl",
+                     column_config={**{c: st.column_config.NumberColumn(format="%d") for c in tab_i.columns
+                                       if c not in ("Analista", "SLA de etapa no prazo", "Dias médios de implantação")},
+                                    "SLA de etapa no prazo": COL_PCT_BARRA,
+                                    "Dias médios de implantação": st.column_config.NumberColumn(format="%.0f")})
+    with card("an_tab_sup", "Suporte por analista", f"Chamados criados de {ini:%d/%m/%Y} a {fim:%d/%m/%Y}; "
+              "\"Em aberto agora\" considera qualquer data"):
+        tab_s = pd.DataFrame({a: resumo_sup(sup[sup["Responsável"] == a], sup_per[sup_per["Responsável"] == a])
+                              for a in sorted(set(sup["Responsável"]))}).T.rename_axis("Analista").reset_index()
+        tab_s[tab_s.columns[1:]] = tab_s[tab_s.columns[1:]].apply(pd.to_numeric, errors="coerce")
+        if not tab_s.empty:
+            st.dataframe(tab_s.sort_values("Chamados no período", ascending=False), hide_index=True, key="t_an_sup",
+                         column_config={**{c: st.column_config.NumberColumn(format="%d") for c in
+                                           ("Chamados no período", "Resolvidos no período", "Em aberto agora",
+                                            "SLAs estourados")},
+                                        "1ª resposta no SLA": COL_PCT_BARRA, "Resolução no SLA": COL_PCT_BARRA,
+                                        "Média 1ª resposta (h)": st.column_config.NumberColumn(format="%.1f"),
+                                        "Média resolução (h)": st.column_config.NumberColumn(format="%.1f")})
 
 
 # ---------- Cards ----------
