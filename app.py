@@ -424,7 +424,7 @@ aba_funil, aba_onb, aba_sup, aba_uso, aba_cards = st.tabs(
 
 # ---------- Funil ----------
 with aba_funil:
-    abertos = impl[impl["Aberto"]]
+    abertos = impl[impl["Aberto"] & (impl["Quadro"] != "Outros")]  # só os Quadros 2, 3 e 4
     parados = abertos[abertos["Dias no status atual"] >= DIAS_ALERTA]
     kpis([dict(t="Em andamento", v=num(len(abertos)))]
          + [dict(t=q, v=num((abertos["Quadro"] == q).sum()), c=COR_QUADRO[q]) for q in QUADROS]
