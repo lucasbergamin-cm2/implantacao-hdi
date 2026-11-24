@@ -44,6 +44,10 @@ QUADROS = {
 COR_QUADRO = {"2. Novas implantações": CIANO, "3. Liberado p/ implantação": AZUL, "4. Onboarding": LIMA_ESCURO}
 QUADRO_DO_STATUS = {s: q for q, lista in QUADROS.items() for s in lista}
 ORDEM_STATUS = [s for lista in QUADROS.values() for s in lista]
+# Ordem do fluxo para os SLAs de etapa (nomes como estão no Jira, sem o "[HDI]")
+ORDEM_ETAPAS_SLA = ["Aguardando termo assinado", "Fila Implantação", "Configuração de ambiente", "Integração",
+                    "Validação", "Validação de Checklist", "Implantação presencial", "Dependência externa",
+                    "Fila Onboarding", "Kickoff", "Treinamento", "Hypercare", "Certificação", "Handoff"]
 ENCERRADOS = {"Implantação Finalizada", "Implantação Cancelada", "Implantação Não Autorizada", "Fechado Sem Resposta",
               "Resolvido", "Transferido para o Suporte"}
 
@@ -454,6 +458,38 @@ with aba_funil:
             st.caption(f"Cards que passaram por **{fila_sel}**"
                        + ("" if clicados else " (a fila mais demorada; clique em outra barra para trocar)"))
             lista(passou.sort_values("Dias na fila", ascending=False), COLS_CARD + ["Dias na fila"], "l_tempo")
+
+    etapas = [m.group(1) for c in impl.columns
+              if (m := re.match(r"^Estourou (.+)$", c)) and m.group(1) not in {"Treinamento"}]
+    etapas.sort(key=lambda e: ORDEM_ETAPAS_SLA.index(e) if e in ORDEM_ETAPAS_SLA else len(ORDEM_ETAPAS_SLA))
+    if etapas:
+        with card("q_sla_etapa", "SLA por etapa (meta do Jira)",
+                  "Cards criados no período que já tiveram o SLA da etapa medido. "
+                  "Clique numa barra para ver os que estouraram"):
+            linhas = []
+            for etapa in etapas:
+                est = impl_per[f"Estourou {etapa}"].astype(str)
+                medidos = est.isin(["Sim", "Não"])
+                if medidos.any():
+                    linhas.append((etapa, (est[medidos] == "Não").mean() * 100, int(medidos.sum()),
+                                   int((est == "Sim").sum())))
+            res_etapa = pd.DataFrame(linhas, columns=["Etapa", "No prazo (%)", "Medidos", "Estourados"])
+            if res_etapa.empty:
+                st.info("Nenhum card do período com SLA de etapa medido.")
+            else:
+                fig = barras(res_etapa["Etapa"], res_etapa["No prazo (%)"], cor=LIMA, contorno=LIMA_ESCURO,
+                             fmt="%{y:.0f}%", y_titulo="% no prazo", altura=300)
+                fig.update_yaxes(range=[0, 110])
+                clicados = selecao(fig, "g_sla_etapa")
+                etapa_sel = clicados[0] if clicados else res_etapa.sort_values("No prazo (%)").iloc[0]["Etapa"]
+                estourados = impl_per[impl_per[f"Estourou {etapa_sel}"].astype(str) == "Sim"].copy()
+                estourados["Tempo na etapa (h)"] = pd.to_numeric(estourados[f"SLA {etapa_sel} (h)"], errors="coerce")
+                st.caption(f"Estouraram o SLA de **{etapa_sel}**: {num(len(estourados))} de "
+                           f"{num(res_etapa.set_index('Etapa').loc[etapa_sel, 'Medidos'])} medidos"
+                           + ("" if clicados else " (a etapa com pior resultado; clique em outra barra para trocar)"))
+                lista(estourados.sort_values("Tempo na etapa (h)", ascending=False),
+                      COLS_CARD + ["Tempo na etapa (h)"], "l_sla_etapa",
+                      extra={"Tempo na etapa (h)": st.column_config.NumberColumn(format="%.1f")})
 
     with card("q_alerta", "4. Alerta de chamado parado na mesma fila",
               "Chamados abertos sem trocar de fila, do mais antigo para o mais recente"):
