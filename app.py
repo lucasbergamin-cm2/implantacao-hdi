@@ -26,6 +26,15 @@ TINTA, TINTA_SUAVE, ALERTA = "#1E2A32", "#5B6B75", "#C0392B"
 FUSO = "America/Sao_Paulo"
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
 DIAS_ALERTA = 7  # chamado parado na mesma fila há esse número de dias entra no alerta
+DIAS_SEM_USO = 7  # revenda sem atendimento há mais que isso entra no alerta de uso
+META_ADERENCIA = 0.7  # checklists de recepção ÷ passagens de chassi no DMS, no mês
+# Módulos do mês (colunas do banco) mostrados no uso por revenda
+MODULOS_USO = {
+    "QTD_CHECKLIST_RECEPCAO": "Checklist recepção", "QTD_ORCAMENTO_RECEPCAO": "Orçamento recepção",
+    "QTD_ORCAMENTO_COMPLEMENTAR": "Orçamento complementar", "QTD_CHECKLIST_OFICINA": "Checklist oficina",
+    "QTD_CHECKLIST_QUALIDADE": "Checklist qualidade", "QTD_CHECKLIST_ENTREGA": "Checklist entrega",
+    "QTD_CHECKLIST_PESQUISA": "Pesquisa", "QTD_OS": "OS Mobato",
+}
 
 # Quadros do Jira (filas do service desk HDI) e os status que compõem cada um
 QUADROS = {
@@ -173,7 +182,7 @@ def tipar(df: pd.DataFrame, datas: list, textos: list, numeros: list) -> pd.Data
             df[c] = "" if c in textos else np.nan
     for c in datas:
         df[c] = para_data(df[c])
-    for c in numeros + [c for c in df.columns if c.startswith("Horas em '")]:
+    for c in numeros + [c for c in df.columns if c.startswith(("Horas em '", "QTD_"))]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     for c in textos:
         df[c] = df[c].fillna("").astype(str).str.strip().replace({"": "Não Informado", "nan": "Não Informado"})
@@ -321,7 +330,7 @@ def barras(x, y, cor=AZUL, horizontal=False, fmt="%{y:,.0f}", y_titulo=None, alt
     if horizontal:
         fig.update_yaxes(autorange="reversed", automargin=True)
         maior = max((len(str(r)) for r in x), default=10)
-        fig.update_layout(margin=dict(l=min(320, 7 * maior), r=36))  # rótulos longos à esquerda, valor à direita
+        fig.update_layout(margin=dict(l=min(340, 8 * maior), r=36))  # rótulos longos à esquerda, valor à direita
     return fig
 
 
@@ -656,32 +665,107 @@ with aba_sup:
 
 # ---------- Uso da ferramenta ----------
 with aba_uso:
-    impl_rev = impl[impl["Revenda_Banco"] != "Não Informado"].copy()
-    impl_rev["Dias sem atendimento"] = (hoje - impl_rev["DATA_ULTIMO_ATENDIMENTO"]).dt.days
-    alertas = impl[impl["Alerta_Cadastro"] != "Não Informado"]
+    st.caption("Uso vindo do banco da Mobato, ligado ao card pelo CNPJ. Os números \"do mês\" vão do dia 1 até hoje; "
+               "a aderência compara checklists de recepção com as passagens de chassi no DMS no mesmo período.")
+    escopo_uso = st.segmented_control(
+        "Mostrar", ["Em onboarding (Quadro 4)", "Implantação finalizada", "Todas com revenda no banco"],
+        default="Em onboarding (Quadro 4)", key="escopo_uso") or "Em onboarding (Quadro 4)"
+    rev = impl[impl["Revenda_Banco"] != "Não Informado"].copy()
+    if escopo_uso.startswith("Em onboarding"):
+        rev = rev[rev["Status"].isin(QUADROS["4. Onboarding"])]
+    elif escopo_uso.startswith("Implantação finalizada"):
+        rev = rev[rev["Status"] == "Implantação Finalizada"]
+
+    ultimo = rev["DATA_ULTIMO_ATENDIMENTO"].where(rev["DATA_ULTIMO_ATENDIMENTO"] <= hoje)  # ignora datas futuras
+    rev["Dias sem uso"] = (hoje - ultimo).dt.days
+    rev["Uso acumulado"] = rev[["QTD_ATENDIMENTO_CHECKLIST_ACUMULADA", "QTD_ATENDIMENTO_ORCAMENTO_ACUMULADO",
+                                "QTD_OS_ACUMULADA"]].fillna(0).sum(axis=1)
+    passagens = rev["QTD_PASSAGENS_CHASSI"].where(rev["QTD_PASSAGENS_CHASSI"] > 0)
+    rev["Aderência"] = (rev["QTD_CHECKLIST_RECEPCAO"] / passagens * 100).clip(upper=150)
+    rev["OS Mobato ÷ DMS"] = rev["QTD_OS"] / rev["QTD_OS_DMS"].where(rev["QTD_OS_DMS"] > 0) * 100
+    rev["Situação de uso"] = np.select(
+        [rev["DATA_PRIMEIRO_ATENDIMENTO"].isna(),  # nenhum atendimento de qualquer tipo no banco
+         rev["Dias sem uso"] > DIAS_SEM_USO,
+         rev["Aderência"] < META_ADERENCIA * 100],
+        ["Nunca usou", f"Parado há mais de {DIAS_SEM_USO} dias", f"Aderência abaixo de {META_ADERENCIA:.0%}"],
+        default="Em uso")
+
     kpis([
-        dict(t="Revendas encontradas no banco", v=num(impl_rev["Revenda_Banco"].nunique())),
-        dict(t="Média de dias da implantação ao 1º atendimento", v="—" if impl_rev["DIAS_IMPLANT_ATE_1O_ATEND"].isna().all()
-             else f"{impl_rev['DIAS_IMPLANT_ATE_1O_ATEND'].mean():.0f}", c=AZUL_ESCURO),
-        dict(t="Sem atendimento há mais de 30 dias", v=num((impl_rev["Dias sem atendimento"] > 30).sum()), c=ALERTA),
-        dict(t="Alertas de cadastro", v=num(len(alertas)), c=CIANO),
+        dict(t="Revendas", v=num(len(rev))),
+        dict(t="Nunca usaram", v=num((rev["Situação de uso"] == "Nunca usou").sum()), c=ALERTA),
+        dict(t=f"Paradas há mais de {DIAS_SEM_USO} dias", v=num(rev["Situação de uso"].str.startswith("Parado").sum()),
+             c=AZUL_ESCURO),
+        dict(t=f"Aderência abaixo de {META_ADERENCIA:.0%}", v=num(rev["Situação de uso"].str.startswith("Aderência").sum()),
+             c=CIANO),
+        dict(t="Aderência mediana no mês", v="—" if rev["Aderência"].isna().all()
+             else f"{rev['Aderência'].median():.0f}%", c=LIMA),
     ])
-    with card("q_usotab", "Uso por revenda implantada", "Mês corrente e acumulado, do banco da Mobato"):
-        lista(impl_rev.sort_values("Dias sem atendimento", ascending=False),
-              ["Link", "Revenda_Banco", "Marca", "UF", "Status", "DATA_IMPLANTACAO", "DATA_PRIMEIRO_ATENDIMENTO",
-               "DIAS_IMPLANT_ATE_1O_ATEND", "DATA_ULTIMO_ATENDIMENTO", "Dias sem atendimento",
-               "QTD_ATENDIMENTO_CHECKLIST", "QTD_ATENDIMENTO_CHECKLIST_ACUMULADA", "QTD_ATENDIMENTO_ORCAMENTO",
-               "QTD_ATENDIMENTO_ORCAMENTO_ACUMULADO", "QTD_OS", "QTD_OS_ACUMULADA"], "l_uso", altura=520,
-              extra={"Revenda_Banco": "Revenda", "DATA_IMPLANTACAO": st.column_config.DateColumn("Implantação", format="DD/MM/YYYY"),
+
+    alerta_uso = rev[rev["Situação de uso"] != "Em uso"]
+    ordem_sit = {"Nunca usou": 0, f"Parado há mais de {DIAS_SEM_USO} dias": 1}
+    with card("q_uso_alerta", "Alerta de uso", f"{escopo_uso}: revendas que nunca usaram, estão sem atendimento há mais "
+              f"de {DIAS_SEM_USO} dias ou com aderência abaixo da meta"):
+        if alerta_uso.empty:
+            st.success("Nenhuma revenda em alerta neste recorte.")
+        else:
+            lista(alerta_uso.assign(_o=alerta_uso["Situação de uso"].map(ordem_sit).fillna(2))
+                  .sort_values(["_o", "Dias sem uso"], ascending=[True, False]),
+                  ["Link", "Revenda_Banco", "Situação de uso", "Status", "Dias no status atual", "DATA_PRIMEIRO_ATENDIMENTO",
+                   "DATA_ULTIMO_ATENDIMENTO", "Dias sem uso", "Aderência", "QTD_CHECKLIST_RECEPCAO",
+                   "QTD_PASSAGENS_CHASSI", "Relator", "UF"], "l_uso_alerta", altura=420,
+                  extra={"Revenda_Banco": "Revenda",
+                         "DATA_PRIMEIRO_ATENDIMENTO": st.column_config.DateColumn("1º atendimento", format="DD/MM/YYYY"),
+                         "DATA_ULTIMO_ATENDIMENTO": st.column_config.DateColumn("Último atendimento", format="DD/MM/YYYY"),
+                         "Dias no status atual": "Dias na etapa",
+                         "Aderência": st.column_config.ProgressColumn("Aderência no mês", format="%.0f%%",
+                                                                      min_value=0, max_value=100),
+                         "QTD_CHECKLIST_RECEPCAO": "Checklists no mês", "QTD_PASSAGENS_CHASSI": "Passagens no mês"})
+
+    e, d = st.columns([3, 2], gap="medium")
+    with e, card("q_uso_ader", "Aderência no mês por revenda",
+                 f"Checklists de recepção ÷ passagens de chassi no DMS. Linha tracejada: meta de {META_ADERENCIA:.0%}. "
+                 "Clique numa barra para ver o detalhe"):
+        ad = rev.dropna(subset=["Aderência"]).sort_values("Aderência").head(25)
+        if ad.empty:
+            st.info("Nenhuma revenda com passagens no DMS neste mês.")
+        else:
+            nomes_ad = ad["Revenda_Banco"].str.slice(0, 32).tolist()
+            fig = barras(nomes_ad, ad["Aderência"].values, horizontal=True, fmt="%{y:.0f}%",
+                         cor=[ALERTA if v < META_ADERENCIA * 100 else LIMA for v in ad["Aderência"]],
+                         altura=max(300, 26 * len(ad)))
+            fig.add_vline(x=META_ADERENCIA * 100, line_dash="dash", line_color=TINTA_SUAVE)
+            clicados = selecao(fig, "g_uso_ader", eixo="y")
+            if clicados:
+                det = ad[ad["Revenda_Banco"].str.slice(0, 32).isin(clicados)]
+                lista(det, ["Link", "Revenda_Banco", "Status", "QTD_CHECKLIST_RECEPCAO", "QTD_PASSAGENS_CHASSI",
+                            "QTD_OS", "QTD_OS_DMS", "DATA_ULTIMO_ATENDIMENTO"], "l_uso_ader",
+                      extra={"Revenda_Banco": "Revenda", "QTD_CHECKLIST_RECEPCAO": "Checklists",
+                             "QTD_PASSAGENS_CHASSI": "Passagens", "QTD_OS": "OS Mobato", "QTD_OS_DMS": "OS DMS"})
+    with d, card("q_uso_mod", "Uso por módulo no mês", "Soma das revendas do recorte"):
+        mods = pd.Series({rot: rev[col].sum() for col, rot in MODULOS_USO.items() if col in rev}).sort_values(ascending=False)
+        grafico(barras(mods.index, mods.values, cor=AZUL, horizontal=True, fmt="%{y:,.0f}",
+                       altura=max(300, 34 * len(mods))), "g_uso_mod")
+
+    with card("q_usotab", "Uso por revenda", "Mês corrente por módulo, acumulado e datas de uso"):
+        cols_mod = [c for c in MODULOS_USO if c in rev.columns]
+        lista(rev.sort_values("Dias sem uso", ascending=False),
+              ["Link", "Revenda_Banco", "Situação de uso", "Status", "Marca", "UF", "DATA_IMPLANTACAO",
+               "DATA_PRIMEIRO_ATENDIMENTO", "DIAS_IMPLANT_ATE_1O_ATEND", "DATA_ULTIMO_ATENDIMENTO", "Dias sem uso",
+               "Aderência", "OS Mobato ÷ DMS"] + cols_mod + ["Uso acumulado"], "l_uso", altura=520,
+              extra={"Revenda_Banco": "Revenda",
+                     "DATA_IMPLANTACAO": st.column_config.DateColumn("Implantação", format="DD/MM/YYYY"),
                      "DATA_PRIMEIRO_ATENDIMENTO": st.column_config.DateColumn("1º atendimento", format="DD/MM/YYYY"),
                      "DATA_ULTIMO_ATENDIMENTO": st.column_config.DateColumn("Último atendimento", format="DD/MM/YYYY"),
                      "DIAS_IMPLANT_ATE_1O_ATEND": "Dias até o 1º atend.",
-                     "QTD_ATENDIMENTO_CHECKLIST": "Checklists (mês)", "QTD_ATENDIMENTO_CHECKLIST_ACUMULADA": "Checklists (total)",
-                     "QTD_ATENDIMENTO_ORCAMENTO": "Orçamentos (mês)", "QTD_ATENDIMENTO_ORCAMENTO_ACUMULADO": "Orçamentos (total)",
-                     "QTD_OS": "OS (mês)", "QTD_OS_ACUMULADA": "OS (total)"})
+                     "Aderência": st.column_config.NumberColumn("Aderência no mês", format="%.0f%%"),
+                     "OS Mobato ÷ DMS": st.column_config.NumberColumn(format="%.0f%%"),
+                     **{c: MODULOS_USO[c] for c in cols_mod}})
+
+    alertas = impl[impl["Alerta_Cadastro"] != "Não Informado"]
     if len(alertas):
         with card("q_cad", "Alertas de cadastro", "Em etapa que exige a revenda criada no banco, mas o CNPJ não foi encontrado"):
             lista(alertas, ["Link", "Resumo", "Status", "Relator", "UF", "Alerta_Cadastro"], "l_cad")
+
 
 # ---------- Cards ----------
 with aba_cards:
