@@ -1,0 +1,8 @@
+streamlit[auth]>=1.45
+# Authlib mais novo quebra o st.login com "400: 'NoneType' object does not support item assignment"
+Authlib==1.3.2
+gspread>=6.0
+pandas>=2.2
+numpy
+plotly>=5.20
+streamlit-keyup>=1.0
