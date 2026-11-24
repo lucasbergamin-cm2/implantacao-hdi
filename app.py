@@ -27,6 +27,11 @@ FUSO = "America/Sao_Paulo"
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
 DIAS_ALERTA = 7  # chamado parado na mesma fila há esse número de dias entra no alerta
 DIAS_SEM_USO = 7  # revenda sem atendimento há mais que isso entra no alerta de uso
+DIAS_ALERTA_ENTRADA = 10  # alertas do pop-up de entrada (onboarding sem uso, Hypercare longo)
+DIAS_PARADO_CRITICO = 30  # card parado na mesma fila há mais que isso entra no pop-up
+# Analistas acompanhados no painel (comparação pelo início do nome do responsável no Jira).
+# "Lia" ainda não tem usuário no Jira: aparece com zero até receber cards.
+ANALISTAS = ["Arthur Domingues", "Carol Rodrigues", "Lia"]
 META_ADERENCIA = 0.7  # checklists de recepção ÷ passagens de chassi no DMS, no mês
 # Módulos do mês (colunas do banco) mostrados no uso por revenda
 MODULOS_USO = {
@@ -381,6 +386,7 @@ except Exception as e:
 
 with st.sidebar:
     st.caption(f"Conectado como {st.user.email}")
+    slot_alertas = st.container()  # botão "⚠️ N alertas", preenchido depois de aplicar os filtros
     min_d = min(impl_todos["Data Criacao"].min(), sup_todos["Data Criacao"].min()
                 if not sup_todos.empty else impl_todos["Data Criacao"].min()).date()
     max_d = agora().date()
@@ -413,6 +419,69 @@ impl_per = impl[impl["Data Criacao"].between(ini_ts, fim_ts)]
 sup = filtrar(sup_todos)
 sup_per = sup[sup["Data Criacao"].between(ini_ts, fim_ts)]
 hoje = agora().normalize()
+
+# ---------- Alertas de entrada ----------
+def calcular_alertas() -> dict:
+    """Listas de cards que merecem atenção imediata (situação atual, com os filtros da barra lateral)."""
+    onb = impl[impl["Status"].isin(QUADROS["4. Onboarding"]) & impl["Aberto"]].copy()
+    inicio_onb = onb["Data Onboarding"].fillna(onb["Status desde"])
+    onb["Dias em onboarding"] = (hoje - inicio_onb).dt.days
+    ultimo = onb["DATA_ULTIMO_ATENDIMENTO"].where(onb["DATA_ULTIMO_ATENDIMENTO"] <= hoje)
+    onb["Dias sem uso"] = (hoje - ultimo).dt.days
+    nunca = onb["DATA_PRIMEIRO_ATENDIMENTO"].isna()
+    onb["Situação de uso"] = np.where(nunca, "Nunca usou", "Sem atendimento recente")
+    sem_uso = onb[(nunca & (onb["Dias em onboarding"] >= DIAS_ALERTA_ENTRADA))
+                  | (onb["Dias sem uso"] >= DIAS_ALERTA_ENTRADA)]
+
+    hyp = impl[(impl["Status"] == "Hypercare") & impl["Inicio Hypercare"].notna()].copy()
+    hyp["Dias em Hypercare"] = (hoje - hyp["Inicio Hypercare"]).dt.days
+    hyp = hyp[hyp["Dias em Hypercare"] >= DIAS_ALERTA_ENTRADA]
+    hyp["Avaliações pendentes"] = [
+        ", ".join(f"{m} dias" for m in (7, 15, 30) if d >= m and r[f"Avaliacao {m} dias"] != "Sim") or "—"
+        for d, (_, r) in zip(hyp["Dias em Hypercare"], hyp.iterrows())]
+
+    parados = impl[impl["Aberto"] & (impl["Quadro"] != "Outros")
+                   & (impl["Dias no status atual"] >= DIAS_PARADO_CRITICO)]
+    sup_estourado = sup[sup["Aberto"] & (sup["Tempo_Restante_Resolucao_h"] < 0)].copy()
+    sup_estourado["Dias em aberto"] = (hoje - sup_estourado["Data Criacao"]).dt.days
+    cadastro = impl[impl["Alerta_Cadastro"] != "Não Informado"]
+    return {
+        f"Onboarding sem uso há {DIAS_ALERTA_ENTRADA}+ dias": (
+            sem_uso.sort_values("Dias em onboarding", ascending=False),
+            ["Link", "Revenda", "Status", "Situação de uso", "Dias em onboarding", "Dias sem uso", "Relator", "UF"]),
+        f"Em Hypercare há {DIAS_ALERTA_ENTRADA}+ dias": (
+            hyp.sort_values("Dias em Hypercare", ascending=False),
+            ["Link", "Resumo", "Inicio Hypercare", "Dias em Hypercare", "Avaliações pendentes", "Relator", "UF"]),
+        f"Parados na mesma fila há {DIAS_PARADO_CRITICO}+ dias": (
+            parados.sort_values("Dias no status atual", ascending=False),
+            ["Link", "Resumo", "Status", "Dias no status atual", "Responsável", "Relator"]),
+        "Suporte com SLA de resolução estourado": (
+            sup_estourado.sort_values("Dias em aberto", ascending=False),
+            ["Link", "Resumo", "Motivo", "Status", "Dias em aberto", "Responsável"]),
+        "Alertas de cadastro no banco": (
+            cadastro, ["Link", "Resumo", "Status", "Alerta_Cadastro", "Relator"]),
+    }
+
+
+@st.dialog("Alertas de hoje", width="large")
+def popup_alertas(alertas: dict) -> None:
+    ativos = {k: v for k, v in alertas.items() if len(v[0])}
+    st.markdown(f"**{len(ativos)} tipo(s) de alerta** com cards que precisam de atenção. Clique para ver a lista.")
+    for i, (titulo, (df, cols)) in enumerate(ativos.items()):
+        with st.expander(f"{titulo}: {num(len(df))}"):
+            lista(df, cols, f"pop_{i}", altura=360)
+    st.caption("Os mesmos dados estão nas abas Funil, Onboarding, Suporte e Uso da ferramenta.")
+    if st.button("Entendi", type="primary"):
+        st.rerun()
+
+
+alertas_entrada = calcular_alertas()
+total_tipos = sum(1 for df, _ in alertas_entrada.values() if len(df))
+if total_tipos:
+    reabrir = slot_alertas.button(f"⚠️ {total_tipos} tipo(s) de alerta", use_container_width=True)
+    if reabrir or not st.session_state.get("alertas_vistos"):
+        st.session_state.alertas_vistos = True  # fechar no X também conta como visto
+        popup_alertas(alertas_entrada)
 
 st.markdown(
     f"<div class='hdr'><div><h1>Implantação e Onboarding</h1>"
@@ -790,6 +859,11 @@ def estourou_suporte(df: pd.DataFrame) -> pd.Series:
             | (df["Aberto"] & (df["Tempo_Restante_Resolucao_h"] < 0)))
 
 
+def do_analista(df: pd.DataFrame, nome: str) -> pd.Series:
+    """Cards cujo responsável começa com o nome configurado ("Lia" pega "Lia Souza", por exemplo)."""
+    return df["Responsável"].str.lower().str.startswith(nome.lower())
+
+
 def resumo_impl(g: pd.DataFrame, g_per: pd.DataFrame) -> dict:
     abertos_g = g[g["Aberto"] & (g["Quadro"] != "Outros")]
     finalizados = g[(g["Status"] == "Implantação Finalizada") & g["Data Resolucao"].between(ini_ts, fim_ts)]
@@ -820,13 +894,14 @@ def resumo_sup(g: pd.DataFrame, g_per: pd.DataFrame) -> dict:
 
 
 with aba_analista:
-    st.caption("Analista é o **responsável atual** do card no Jira. Cards sem responsável aparecem como "
-               "\"Não Informado\". Os números \"no período\" usam o período da barra lateral.")
-    nomes_analistas = sorted((set(impl["Responsável"]) | set(sup["Responsável"])) - {"Não Informado"})
-    analista = st.selectbox("Ver detalhe do analista", nomes_analistas, index=None, placeholder="Escolha um analista")
+    st.caption("Analista é o **responsável atual** do card no Jira. Mostra só os analistas do time de implantação "
+               "(lista `ANALISTAS` no código). Os números \"no período\" usam o período da barra lateral.")
+    analista = st.selectbox("Ver detalhe do analista", ANALISTAS, index=None, placeholder="Escolha um analista")
     if analista:
-        mi, mi_per = impl[impl["Responsável"] == analista], impl_per[impl_per["Responsável"] == analista]
-        ms, ms_per = sup[sup["Responsável"] == analista], sup_per[sup_per["Responsável"] == analista]
+        mi, mi_per = impl[do_analista(impl, analista)], impl_per[do_analista(impl_per, analista)]
+        ms, ms_per = sup[do_analista(sup, analista)], sup_per[do_analista(sup_per, analista)]
+        if mi.empty and ms.empty:
+            st.info(f"{analista} ainda não tem cards no Jira como responsável.")
         ri, rs = resumo_impl(mi, mi_per), resumo_sup(ms, ms_per)
         st.markdown("**Implantação**")
         kpis([
@@ -873,8 +948,8 @@ with aba_analista:
 
     with card("an_tab_impl", "Implantação por analista", f"\"No período\": cards criados ou finalizados de "
               f"{ini:%d/%m/%Y} a {fim:%d/%m/%Y}; \"Em andamento\" e \"Parados\" são a situação atual"):
-        tab_i = pd.DataFrame({a: resumo_impl(impl[impl["Responsável"] == a], impl_per[impl_per["Responsável"] == a])
-                              for a in sorted(set(impl["Responsável"]))}).T.rename_axis("Analista").reset_index()
+        tab_i = pd.DataFrame({a: resumo_impl(impl[do_analista(impl, a)], impl_per[do_analista(impl_per, a)])
+                              for a in ANALISTAS}).T.rename_axis("Analista").reset_index()
         tab_i[tab_i.columns[1:]] = tab_i[tab_i.columns[1:]].apply(pd.to_numeric, errors="coerce")
         st.dataframe(tab_i.sort_values("Em andamento", ascending=False), hide_index=True, key="t_an_impl",
                      column_config={**{c: st.column_config.NumberColumn(format="%d") for c in tab_i.columns
@@ -883,8 +958,8 @@ with aba_analista:
                                     "Dias médios de implantação": st.column_config.NumberColumn(format="%.0f")})
     with card("an_tab_sup", "Suporte por analista", f"Chamados criados de {ini:%d/%m/%Y} a {fim:%d/%m/%Y}; "
               "\"Em aberto agora\" considera qualquer data"):
-        tab_s = pd.DataFrame({a: resumo_sup(sup[sup["Responsável"] == a], sup_per[sup_per["Responsável"] == a])
-                              for a in sorted(set(sup["Responsável"]))}).T.rename_axis("Analista").reset_index()
+        tab_s = pd.DataFrame({a: resumo_sup(sup[do_analista(sup, a)], sup_per[do_analista(sup_per, a)])
+                              for a in ANALISTAS}).T.rename_axis("Analista").reset_index()
         tab_s[tab_s.columns[1:]] = tab_s[tab_s.columns[1:]].apply(pd.to_numeric, errors="coerce")
         if not tab_s.empty:
             st.dataframe(tab_s.sort_values("Chamados no período", ascending=False), hide_index=True, key="t_an_sup",
